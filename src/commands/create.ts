@@ -163,10 +163,14 @@ export function registerCreateCommand(program: Command): void {
     .option('--org-id <id>', 'Organization ID')
     .option('--region <region>', 'Deployment region (us-east, us-west, eu-central, ap-southeast)')
     .option('--template <template>', 'Template to use: react, nextjs, chatbot, crm, e-commerce, todo, or empty')
+    .option('--marketplace <slug>', 'Install a marketplace template by slug (browse: https://insforge.dev/templates)')
     .option('--auth <provider>', 'Wire a third-party auth provider into the chosen template (currently: better-auth)')
     .action(async (opts, cmd) => {
       const { json, apiUrl } = getRootOpts(cmd);
       try {
+        if (opts.marketplace && opts.template) {
+          throw new CLIError('--marketplace and --template are mutually exclusive');
+        }
         await requireAuth(apiUrl, false);
 
         if (!json) {
@@ -238,6 +242,13 @@ export function registerCreateCommand(program: Command): void {
 
         if (template && !validTemplates.includes(template)) {
           throw new CLIError(`Invalid template "${template}". Valid options: ${validTemplates.join(', ')}`);
+        }
+        // Marketplace skips the interactive picker — discovery is web-only — but otherwise
+        // behaves like a regular template install (creates ./<projectName>/ subdir). Setting
+        // `template` to the slug makes `hasTemplate` true downstream; the download switch
+        // below short-circuits to the marketplace branch ahead of the githubTemplates check.
+        if (opts.marketplace) {
+          template = opts.marketplace as string;
         }
         if (!template) {
           if (json) {
@@ -348,7 +359,10 @@ export function registerCreateCommand(program: Command): void {
 
         // 7. Download template or seed env for blank projects
         const githubTemplates = ['chatbot', 'crm', 'e-commerce', 'nextjs', 'react', 'todo'];
-        if (githubTemplates.includes(template!)) {
+        if (opts.marketplace) {
+          await downloadMarketplaceTemplate(opts.marketplace as string, projectConfig, json);
+          void reportMarketplaceDownload(opts.marketplace as string, apiUrl ?? 'https://api.insforge.dev');
+        } else if (githubTemplates.includes(template!)) {
           await downloadGitHubTemplate(template!, projectConfig, json);
         } else if (hasTemplate) {
           await downloadTemplate(template as Framework, projectConfig, projectName, json, apiUrl);
@@ -691,3 +705,126 @@ export async function downloadGitHubTemplate(
   }
 }
 
+export async function downloadMarketplaceTemplate(
+  slug: string,
+  projectConfig: ProjectConfig,
+  json: boolean,
+): Promise<void> {
+  const s = !json ? clack.spinner() : null;
+  s?.start(`Downloading marketplace template "${slug}"...`);
+
+  const tempDir = path.join(tmpdir(), `insforge-marketplace-${Date.now()}`);
+
+  try {
+    await fs.mkdir(tempDir, { recursive: true });
+
+    const templatesRepo =
+      process.env.INSFORGE_TEMPLATES_REPO ?? 'https://github.com/InsForge/insforge-templates.git';
+    if (!SAFE_REPO_PATTERN.test(templatesRepo)) {
+      throw new Error(`INSFORGE_TEMPLATES_REPO has unsupported characters: ${templatesRepo}`);
+    }
+    const templatesBranch = process.env.INSFORGE_TEMPLATES_BRANCH;
+    if (templatesBranch !== undefined && !SAFE_BRANCH_PATTERN.test(templatesBranch)) {
+      throw new Error(`INSFORGE_TEMPLATES_BRANCH has unsupported characters: ${templatesBranch}`);
+    }
+    const cloneArgs = ['clone', '--depth', '1'];
+    if (templatesBranch) cloneArgs.push('-b', templatesBranch);
+    cloneArgs.push('--', templatesRepo, '.');
+    await execFileAsync('git', cloneArgs, {
+      cwd: tempDir,
+      maxBuffer: 10 * 1024 * 1024,
+      timeout: 60_000,
+    });
+
+    const templateDir = path.join(tempDir, slug);
+    const stat = await fs.stat(templateDir).catch(() => null);
+    if (!stat?.isDirectory()) {
+      throw new Error(
+        `Template "${slug}" not found.\nBrowse available templates: https://insforge.dev/templates`,
+      );
+    }
+
+    s?.message('Copying template files...');
+    const cwd = process.cwd();
+    await copyDir(templateDir, cwd);
+
+    // Seed .env.local from .env.example (same logic as downloadGitHubTemplate).
+    const envExamplePath = path.join(cwd, '.env.example');
+    const envExampleExists = await fs.stat(envExamplePath).catch(() => null);
+    if (envExampleExists) {
+      const anonKey = await getAnonKey();
+      const envExample = await fs.readFile(envExamplePath, 'utf-8');
+      const envFinal = envExample.replace(
+        /^([A-Z][A-Z0-9_]*=)(.*)$/gm,
+        (_, prefix: string, _value: string) => {
+          const key = prefix.slice(0, -1);
+          if (/INSFORGE.*(URL|BASE_URL)$/.test(key)) return `${prefix}${projectConfig.oss_host}`;
+          if (/INSFORGE.*ANON_KEY$/.test(key)) return `${prefix}${anonKey}`;
+          if (key === 'NEXT_PUBLIC_APP_URL') {
+            return `${prefix}https://${projectConfig.appkey}.insforge.site`;
+          }
+          return `${prefix}${_value}`;
+        },
+      );
+      const envLocalPath = path.join(cwd, '.env.local');
+      try {
+        await fs.writeFile(envLocalPath, envFinal, { flag: 'wx' });
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code === 'EEXIST') {
+          if (!json) clack.log.warn('.env.local already exists; skipping env seeding.');
+        } else {
+          throw e;
+        }
+      }
+    }
+
+    s?.stop(`Marketplace template "${slug}" downloaded`);
+
+    // Auto-run db_init.sql if present (parity with downloadGitHubTemplate).
+    const migrationPath = path.join(cwd, 'migrations', 'db_init.sql');
+    const migrationExists = await fs.stat(migrationPath).catch(() => null);
+    if (migrationExists) {
+      const dbSpinner = !json ? clack.spinner() : null;
+      dbSpinner?.start('Running database migrations...');
+      try {
+        const sql = await fs.readFile(migrationPath, 'utf-8');
+        await runRawSql(sql, true);
+        dbSpinner?.stop('Database migrations applied');
+      } catch (err) {
+        dbSpinner?.stop('Database migration failed');
+        if (!json) {
+          clack.log.warn(`Migration failed: ${(err as Error).message}`);
+        } else {
+          throw err;
+        }
+      }
+    }
+  } catch (err) {
+    s?.stop(`Marketplace template "${slug}" download failed`);
+    throw err;
+  } finally {
+    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Fire-and-forget POST to the marketplace download counter.
+ * Network errors and non-2xx responses are swallowed — a transient
+ * counter blip must not kill the install. The DB counter is the source
+ * of truth; PostHog is intentionally not used (per spec §6.3).
+ */
+export async function reportMarketplaceDownload(slug: string, apiUrl: string): Promise<void> {
+  try {
+    const res = await fetch(`${apiUrl}/templates/v1/${encodeURIComponent(slug)}/downloads`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    if (!res.ok) {
+      // Swallow — best-effort counter ping.
+      return;
+    }
+  } catch {
+    // Swallow — best-effort counter ping.
+  }
+}
