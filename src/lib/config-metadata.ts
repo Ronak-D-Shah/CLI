@@ -98,13 +98,7 @@ async function fetchOptionalJson<T>(path: string): Promise<T | undefined> {
 function isOptionalEndpointUnsupported(err: unknown): boolean {
   if (!(err instanceof CLIError)) return false;
   const message = err.message.toLowerCase();
-  return (
-    err.code === 'NOT_FOUND' ||
-    message.includes('oss request failed: 404') ||
-    message.includes('not found') ||
-    message.includes('not available') ||
-    message.includes('not enabled')
-  );
+  return message === 'oss request failed: 404' || message.startsWith('oss request failed: 404\n');
 }
 
 /**

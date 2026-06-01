@@ -8,10 +8,13 @@ import type * as ErrorsModule from '../../lib/errors.js';
 
 let nextMetadataResponse: unknown = {};
 let nextStorageConfigResponse: unknown;
+let nextRealtimeConfigResponse: unknown;
+let nextSchedulesConfigResponse: unknown;
 const ossFetchMock = vi.fn(async (path: string) => {
-  const body = path === '/api/storage/config'
-    ? nextStorageConfigResponse ?? {}
-    : nextMetadataResponse;
+  let body: unknown = nextMetadataResponse;
+  if (path === '/api/storage/config') body = nextStorageConfigResponse ?? {};
+  if (path === '/api/realtime/config') body = nextRealtimeConfigResponse ?? {};
+  if (path === '/api/schedules/config') body = nextSchedulesConfigResponse ?? {};
   return new Response(JSON.stringify(body), {
     status: 200,
     headers: { 'content-type': 'application/json' },
@@ -72,6 +75,8 @@ let tmp: string;
 beforeEach(() => {
   vi.clearAllMocks();
   nextStorageConfigResponse = undefined;
+  nextRealtimeConfigResponse = undefined;
+  nextSchedulesConfigResponse = undefined;
   tmp = mkdtempSync(join(tmpdir(), 'insforge-plan-test-'));
 });
 
@@ -116,6 +121,25 @@ describe('config plan (capability probe)', () => {
     const docs = await runJson(program, ['--json', 'config', 'plan', '--file', tomlPath]);
     const result = docs[0] as { changes: unknown[]; skipped: string[] };
     expect(result.changes).toHaveLength(1);
+    expect(result.skipped).toEqual([]);
+
+    rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it('uses optional config endpoint support for realtime and schedules changes', async () => {
+    nextMetadataResponse = { auth: {} };
+    nextRealtimeConfigResponse = { retentionDays: 7 };
+    nextSchedulesConfigResponse = { retentionDays: null };
+    const tomlPath = join(tmp, 'insforge.toml');
+    writeFileSync(
+      tomlPath,
+      '[realtime]\nretention_days = 14\n\n[schedules]\nretention_days = 30\n',
+    );
+
+    const program = makeProgram();
+    const docs = await runJson(program, ['--json', 'config', 'plan', '--file', tomlPath]);
+    const result = docs[0] as { changes: unknown[]; skipped: string[] };
+    expect(result.changes).toHaveLength(2);
     expect(result.skipped).toEqual([]);
 
     rmSync(tmp, { recursive: true, force: true });
